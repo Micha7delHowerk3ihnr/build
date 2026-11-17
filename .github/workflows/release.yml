@@ -1,0 +1,69 @@
+name: Public release
+
+on:
+  repository_dispatch:
+    types: [release-trigger]
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Private repository tag or commit
+        required: true
+        type: string
+      release_tag:
+        description: Public release tag
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: public-release-${{ github.event.client_payload.tag || inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  packages:
+    uses: ./.github/workflows/package.yml
+    with:
+      source_ref: ${{ github.event.client_payload.sha || inputs.source_ref }}
+      app_environment: release
+      require_android_signing: true
+    secrets: inherit
+
+  publish:
+    name: Publish public release
+    needs: packages
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: dist
+
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          for directory in dist/package-*; do
+            [ -d "$directory" ] || continue
+            suffix="${directory##*/package-}"
+            while IFS= read -r file; do
+              filename="$(basename "$file")"
+              stem="${filename%.*}"
+              extension="${filename##*.}"
+              cp "$file" "release-assets/${stem}-${suffix}.${extension}"
+            done < <(find "$directory" -type f ! -path '*/native/*' \( -name '*.apk' -o -name '*.deb' -o -name '*.rpm' -o -name '*.exe' -o -name '*.dmg' \))
+          done
+          test -n "$(find release-assets -type f -print -quit)"
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.client_payload.tag || inputs.release_tag }}
+          generate_release_notes: true
+          body: |
+            Source revision: `${{ needs.packages.outputs.source_sha }}`
+            Build run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          files: release-assets/*
+          fail_on_unmatched_files: true

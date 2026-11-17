@@ -1,0 +1,69 @@
+# SingTools build orchestrator
+
+This repository contains only GitHub Actions workflows. It checks out an exact
+revision of the private SingTools source repository and delegates all native and
+application packaging to that revision's `tool/native_build.dart` and
+`setup.dart` entrypoints.
+
+Before packaging, `test.yml` resolves the requested branch, tag, or commit to an
+immutable source SHA. All test jobs and subsequent package/native build jobs
+check out that SHA, even if the requested branch moves while tests are running.
+Both release workflows record this resolved SHA in the release body.
+
+The Go toolchain version is read from the checked-out source's
+`libcore/go.mod`; there is no second dependency lock file in this repository.
+
+Android jobs explicitly install the minimum platform (at least API 24), plus the
+compile SDK and NDK declared by the selected Flutter SDK. The target native API
+comes from the checked-out source's `native/targets.json`; its Clang and Clang++
+executables must exist before building. Jobs no longer select whichever NDK
+happens to be newest on the runner. Raising the minimum runtime to Android 7.0
+does not lower the compile SDK required by Flutter.
+
+- `build.yaml` handles `build-trigger` dispatches and replaces the public
+  `pre-release` assets.
+- `release.yml` handles `release-trigger` dispatches and publishes the matching
+  source tag.
+- `test.yml` is a reusable test gate and can also be started manually. It runs
+  Flutter behavior tests and the CMake manifest contracts on Linux, plus native
+  Go tests with race detection on Linux, macOS, and Windows. Coverage reports are
+  uploaded separately from package artifacts. Go feature tags come from the
+  selected source's `libcore/Makefile`.
+  The Flutter gate also runs static analysis and installs RPM tools so package
+  content tests execute. macOS additionally compiles and runs the Swift system
+  proxy transaction suite against isolated preferences without changing the
+  runner's network settings.
+- `native.yml` is a manual manifest-only diagnostic build, gated by the same
+  test workflow.
+- `package.yml` is the shared private-source packaging matrix. It waits for every
+  test job to pass before starting the build matrix; a failure prevents packaging
+  and the dependent release publication.
+
+Release downloads contain application installers only. Native manifests remain
+in the Actions artifacts for diagnostics and are not attached to releases.
+
+Pre-release runs share one concurrency group and replace the entire existing
+release, including its notes, assets, and tag. Cleanup errors stop publication;
+only an absent release or tag is ignored. The fixed `pre-release` URL is kept.
+Its tag points to a fresh commit with the public workflow revision's unchanged
+tree, so its date reflects publication rather than an old workflow commit. No
+branch is changed. This refreshes its position in GitHub's chronological release
+list; GitHub does not provide permanent pinning or allow prereleases to be marked
+as the latest stable release.
+
+All pre-release packages use the same `YYYYMMDD` build number, before packaging 
+(for example, `0.1.2+20261026`). The version override is applied only in the 
+build checkout; stable releases keep the source version. The release body records 
+both the build date and the exact source SHA.
+
+The selected source revision must include the test suites, including
+`test/native/manifest_contract_test.py`. Older source revisions lacking that
+contract are rejected instead of silently skipping the manifest checks. macOS
+jobs also require `test/native/system_proxy_test.py` and its Swift implementation.
+These jobs do not replace device tests or installed-package/FFI smoke tests. The native
+contract suite uses the source's default Go feature tags without building the
+external subconverter library.
+
+Required repository secrets are `PRIVATE_REPO` and `ACCESS_TOKEN`. Android
+release publication also requires `KEYSTORE`, `KEY_ALIAS`, `STORE_PASSWORD`,
+and `KEY_PASSWORD`.
