@@ -1,0 +1,189 @@
+name: Test private source contracts
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Private repository branch, tag, or commit
+        type: string
+        required: true
+        default: dev-next
+  workflow_call:
+    inputs:
+      source_ref:
+        type: string
+        required: true
+    outputs:
+      source_sha:
+        description: Exact private source commit used by all test jobs
+        value: ${{ jobs.resolve.outputs.source_sha }}
+      flutter_version:
+        description: Flutter version pinned by the tested source revision
+        value: ${{ jobs.resolve.outputs.flutter_version }}
+    secrets:
+      PRIVATE_REPO:
+        required: true
+      ACCESS_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Pin private source revision
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+      flutter_version: ${{ steps.toolchain.outputs.flutter_version }}
+      gradle_version: ${{ steps.toolchain.outputs.gradle_version }}
+      allow_analyzer_infos: ${{ steps.toolchain.outputs.allow_analyzer_infos }}
+    steps:
+      - name: Checkout requested private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_REPO }}
+          token: ${{ secrets.ACCESS_TOKEN }}
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+      - name: Resolve immutable commit
+        id: source
+        shell: bash
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Read toolchain pins from the source revision
+        id: toolchain
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          import re
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/test.yml').read_text(encoding='utf-8')
+          flutter = re.findall(r"""^[ \t]+flutter-version:[ \t]*['"]?([0-9]+\.[0-9]+\.[0-9]+)['"]?[ \t]*$""", workflow, re.M)
+          if not flutter or len(set(flutter)) != 1:
+              raise SystemExit('Source test workflow must pin one exact Flutter version')
+
+          wrapper = Path('android/gradle/wrapper/gradle-wrapper.properties').read_text(encoding='utf-8')
+          gradle = re.search(r'^distributionUrl=[^\r\n]*/gradle-([0-9]+\.[0-9]+(?:\.[0-9]+)?)-(?:all|bin)\.zip$', wrapper, re.M)
+          if gradle is None:
+              raise SystemExit('Source Gradle wrapper must pin an exact Gradle version')
+
+          analyze = re.search(r'^[ \t]*(?:-[ \t]*)?run:[ \t]+flutter analyze\b([^\r\n]*)', workflow, re.M)
+          allow_infos = analyze is not None and '--no-fatal-infos' in analyze[1].split()
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              print(f'flutter_version={flutter[0]}', file=output)
+              print(f'gradle_version={gradle[1]}', file=output)
+              print(f'allow_analyzer_infos={str(allow_infos).lower()}', file=output)
+          PYTHON
+
+  flutter:
+    name: Flutter behavior and manifest contracts
+    needs: resolve
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout pinned private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_REPO }}
+          token: ${{ secrets.ACCESS_TOKEN }}
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          persist-credentials: false
+      - uses: subosito/flutter-action@v2.21.0
+        with:
+          flutter-version: ${{ needs.resolve.outputs.flutter_version }}
+          channel: stable
+          cache: true
+      - run: flutter pub get --enforce-lockfile
+      - name: Analyze Dart sources
+        shell: bash
+        env:
+          ALLOW_ANALYZER_INFOS: ${{ needs.resolve.outputs.allow_analyzer_infos }}
+        run: |
+          flags=(--no-pub)
+          if [ "$ALLOW_ANALYZER_INFOS" = true ]; then flags+=(--no-fatal-infos); fi
+          flutter analyze "${flags[@]}"
+      - name: Install RPM tools for package content tests
+        run: sudo apt-get update && sudo apt-get install -y rpm
+      - run: flutter test --coverage
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ needs.resolve.outputs.gradle_version }}
+      - name: Test manifest rejection and artifact selection
+        run: |
+          test -f test/native/manifest_contract_test.py
+          python3 -m unittest discover -s test/native -p '*_test.py'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: flutter-coverage
+          path: coverage/lcov.info
+          if-no-files-found: warn
+
+  native:
+    name: Native contracts (${{ matrix.os }})
+    needs: resolve
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15, windows-2022]
+    steps:
+      - name: Configure Windows build paths
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          $workspace = [System.IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\')
+          $parent = Split-Path -Parent $workspace
+          $leaf = Split-Path -Leaf $workspace
+          subst S: "$parent"
+          "SHORT_WORKSPACE=S:/$leaf" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Checkout pinned private source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_REPO }}
+          token: ${{ secrets.ACCESS_TOKEN }}
+          ref: ${{ needs.resolve.outputs.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: libcore/go.mod
+          cache-dependency-path: libcore/go.sum
+      - name: Install Windows Subconverter toolchain
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install -y --no-progress make mingw cmake ninja pkgconfiglite
+      - name: Test native contracts with race detection
+        working-directory: libcore
+        shell: bash
+        run: |
+          tags="$(sed -n 's/^GO_TAGS ?= //p' Makefile)"
+          test -n "$tags"
+          # GO_TAGS includes badlinkname; match the source Makefile linker contract.
+          # Serenity instantiates sing/common.Dup in its template package; its
+          # uintptr conversion trips checkptr under -race. Keep race enabled.
+          go test -tags "$tags" -ldflags=-checklinkname=0 -gcflags=github.com/sagernet/serenity/template=-d=checkptr=0 -race -timeout 10m -coverprofile=coverage.out ./...
+      - name: Test native Subconverter on Windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cd "$SHORT_WORKSPACE/libcore"
+          if [ ! -f ../native/subconverter-revision.txt ]; then
+            echo "::notice::The selected revision predates the pinned Subconverter build"
+            exit 0
+          fi
+          make test-subconverter OS=windows ARCH=amd64 CC=gcc CXX=g++ CMAKE_ARGS=-DCMAKE_SYSTEM_NAME=Windows WITH_SUBCONVERTER=1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-coverage-${{ matrix.os }}
+          path: libcore/coverage.out
+          if-no-files-found: warn

@@ -1,0 +1,170 @@
+name: Public package release
+
+on:
+  repository_dispatch:
+    types: [build-trigger, release-trigger]
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Private branch, tag, or commit (defaults to the release tag or dev-next)
+        type: string
+      release_tag:
+        description: Public stable release tag (leave empty for the rolling pre-release)
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: public-${{ github.event.client_payload.tag || inputs.release_tag || 'pre-release' }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    name: Resolve release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      build_number: ${{ steps.version.outputs.build_number }}
+      build_date: ${{ steps.version.outputs.build_date }}
+      tag: ${{ steps.version.outputs.tag }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - name: Allocate a build number shared by both channels
+        id: version
+        shell: bash
+        env:
+          STABLE_TAG: ${{ github.event.client_payload.tag || inputs.release_tag }}
+          DISPATCH_TYPE: ${{ github.event.action }}
+        run: |
+          set -euo pipefail
+          # Preserve the eight-digit format expected by older source revisions.
+          # Start above the YYYYMMDD version codes of already published APKs.
+          build_number=$((30000000 + GITHUB_RUN_NUMBER))
+          test "$build_number" -le 99999999
+          prerelease=false
+          tag="$STABLE_TAG"
+          if [ -z "$tag" ]; then
+            test "$DISPATCH_TYPE" != release-trigger
+            prerelease=true
+            tag=pre-release
+          else
+            test "$tag" != pre-release
+            git check-ref-format "refs/tags/$tag"
+          fi
+          {
+            echo "build_number=$build_number"
+            echo "build_date=$(TZ=Asia/Shanghai date +%Y%m%d)"
+            echo "tag=$tag"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+  packages:
+    needs: metadata
+    uses: ./.github/workflows/package.yml
+    with:
+      source_ref: ${{ github.event.client_payload.sha || inputs.source_ref || inputs.release_tag || 'dev-next' }}
+      app_environment: release
+      require_android_signing: true
+      build_number: ${{ needs.metadata.outputs.build_number }}
+    secrets: inherit
+
+  publish:
+    name: Publish public release
+    needs: [metadata, packages]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: dist
+
+      - name: Prepare release assets
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          for directory in dist/package-*; do
+            [ -d "$directory" ] || continue
+            suffix="${directory##*/package-}"
+            while IFS= read -r file; do
+              filename="$(basename "$file")"
+              stem="${filename%.*}"
+              extension="${filename##*.}"
+              cp "$file" "release-assets/${stem}-${suffix}.${extension}"
+            done < <(find "$directory" -type f ! -path '*/native/*' \( -name '*.apk' -o -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.exe' -o -name '*.dmg' \))
+          done
+          test -n "$(find release-assets -type f -print -quit)"
+
+      - name: Remove old pre-release and refresh its tag
+        id: refresh
+        if: needs.metadata.outputs.prerelease == 'true'
+        uses: actions/github-script@v7
+        env:
+          SOURCE_SHA: ${{ needs.packages.outputs.source_sha }}
+          BUILD_NUMBER: ${{ needs.metadata.outputs.build_number }}
+        with:
+          script: |
+            const repo = context.repo;
+            const tag = 'pre-release';
+            // Only a missing resource is safe to ignore. Auth/network errors must stop publication.
+            async function findOrNull(request) {
+              try {
+                return (await request()).data;
+              } catch (error) {
+                if (error.status === 404) return null;
+                throw error;
+              }
+            }
+            const release = await findOrNull(() =>
+              github.rest.repos.getReleaseByTag({ ...repo, tag }));
+            if (release) {
+              const publishedBuild = /^Build number: `(\d+)`$/m.exec(release.body || '')?.[1];
+              if (Number(publishedBuild) > Number(process.env.BUILD_NUMBER)) {
+                core.info('A newer build already owns the rolling pre-release');
+                core.setOutput('skip', 'true');
+                return;
+              }
+              await github.rest.repos.deleteRelease({ ...repo, release_id: release.id });
+            }
+            const ref = `tags/${tag}`;
+            const existingTag = await findOrNull(() =>
+              github.rest.git.getRef({ ...repo, ref }));
+            if (existingTag) {
+              await github.rest.git.deleteRef({ ...repo, ref });
+            }
+            // GitHub sorts releases using tag/commit dates. A fresh public-only
+            // snapshot gives this build a current date without changing any branch.
+            const { data: base } = await github.rest.git.getCommit({
+              ...repo, commit_sha: context.sha,
+            });
+            const identity = {
+              name: 'github-actions[bot]',
+              email: '41898282+github-actions[bot]@users.noreply.github.com',
+              date: new Date().toISOString(),
+            };
+            const { data: commit } = await github.rest.git.createCommit({
+              ...repo,
+              message: `Pre-release ${process.env.BUILD_NUMBER}\n\nSource revision: ${process.env.SOURCE_SHA}\nBuild run: ${context.runId}`,
+              tree: base.tree.sha,
+              parents: [base.sha],
+              author: identity,
+              committer: identity,
+            });
+            await github.rest.git.createRef({ ...repo, ref: `refs/${ref}`, sha: commit.sha });
+
+      - name: Publish release assets
+        if: steps.refresh.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.metadata.outputs.tag }}
+          name: ${{ needs.metadata.outputs.prerelease == 'true' && 'Pre-Release' || needs.metadata.outputs.tag }}
+          prerelease: ${{ needs.metadata.outputs.prerelease }}
+          make_latest: ${{ needs.metadata.outputs.prerelease == 'true' && 'false' || 'true' }}
+          generate_release_notes: ${{ needs.metadata.outputs.prerelease == 'false' }}
+          body: |
+            Build number: `${{ needs.metadata.outputs.build_number }}`
+            Build date (Asia/Shanghai): `${{ needs.metadata.outputs.build_date }}`
+            Source revision: `${{ needs.packages.outputs.source_sha }}`
+            Build run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          files: release-assets/*
+          fail_on_unmatched_files: true
